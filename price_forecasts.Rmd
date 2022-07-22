@@ -1,0 +1,657 @@
+---
+title: "Looking Ahead to Heating Prices at the Start of the Next Two Heating Seasons in Maine"
+author: "Roux Institute - Analytics Capstone Spring 2022"
+output: html_document
+---
+```{r echo=FALSE}
+knitr::opts_chunk$set(fig.width=8, fig.height=4, fig.align="center") 
+# Comments about see user guide for instructions
+```
+<br>
+
+```{r SETUP, include=FALSE}
+
+# Packages required for this markdown file
+list.of.packages <- c("readxl", "dplyr", "lubridate", "forecast", "tidyr",
+                      "ggplot2", "kableExtra")
+
+# Check which packages from the list have not been installed on local machine,
+# and install those which have not.
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+# Load packages
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(forecast)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+
+# Set working directory to folder containing this .Rmd file
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+
+# Supress warning messages
+warn = getOption("warn")
+options(warn=-1)
+
+```
+
+```{r DEFINE FUNCTIONS, include=FALSE}
+
+# FUNCTION TO INSERT MISSING MONTHS INTO MONTYLY DATA WITH NA PRICE
+missing_months <- function(df) {
+  
+  # Find the column named "month" in the dataframe
+  month_column <- df[ , which(colnames(df)=="month")]
+  
+  # Create new dataframe with full range of months from first to last month
+  first_month <- min(month_column)
+  last_month <- max(month_column)
+  month_range <- data.frame(seq(first_month, last_month, by="month"))
+  colnames(month_range) <- "month"
+  
+  # Merge month_range with original df
+  df <- merge(month_range, df, by="month", all.x = TRUE)
+  
+  return(df)
+}
+```
+
+
+
+```{r IMPORT HEATING OIL DATA, include=FALSE}
+
+# Define file name/location and import
+file <- file.path("data", "historical propane - k1 - #2 price tables_charts1.xlsx")
+heatingoil <- as.data.frame(
+  read_excel(file, sheet = "#2 chart & monthly averages",
+             range = cell_cols("A:B"),
+             col_names = c("month", "heatingoil_per_gal"),
+             col_types = c("date", "numeric")
+  ))
+heatingoil <- heatingoil[-c(1,2), ]  # remove 1st two rows (contain NA only)
+
+# Convert month to Date format
+heatingoil$month <- as.Date(heatingoil$month)
+
+# Fill in missing months
+heatingoil <- missing_months(heatingoil)
+
+# Find earliest month in heating oil price data to use as basis for other datasets
+startmonth <- as.Date(min(heatingoil$month)) 
+endmonth <- as.Date(max(heatingoil$month)) 
+
+```
+
+
+```{r IMPORT DIESEL DATA, include=FALSE}
+# NOTE: This data is used to impute the missing values of heating oil prices
+
+# Define file name/location and import
+file <- file.path("data", "psw18vwall.xls")
+diesel <- as.data.frame(
+  read_excel(file, 
+             sheet = "Data 2",
+             range = cell_cols("A:D"),
+             col_names = c("month", "delete", "delete2", "diesel_per_gal"),
+             col_types = c("date", "numeric", "numeric", "numeric")
+  ))
+diesel <- diesel[-c(1,3), ]  # remove 1st three rows (contain NA only)
+
+# Delete middle two columns (data for other regions)
+diesel <- dplyr::select(diesel, c(-delete, -delete2))
+
+# Dates for diesel prices are currently for the 15th of the month
+# Revise to be the 1st of the month to match other datasets
+diesel$month <- as.Date(floor_date(as.Date(diesel$month), unit="months"))
+
+# Remove dates with no pricing data (NA) at the beginning 
+diesel <- diesel[!is.na(diesel$diesel_per_gal),]
+
+# Filter diesel data to start/end at the same point as heating oil data
+diesel <- diesel %>% 
+  filter(month >= startmonth) %>% 
+  filter(month <= endmonth)
+
+```
+
+
+```{r IMPUTE MISSING HEATING OIL PRICES, include=FALSE}
+
+# Merge diesel prices with heating oil prices
+heatingoil <- merge(heatingoil, diesel, by="month")
+heatingoil$original <- heatingoil$heatingoil_per_gal
+
+# Define linear regession model for relationship between heating oil and diesel prices
+linear_mod <- lm(heatingoil_per_gal ~ diesel_per_gal, data=heatingoil)
+
+# Calculate imputed heating oil price value using linear model
+heatingoil$imputed_per_gal <- linear_mod$coefficients[1] + 
+  (heatingoil$diesel_per_gal * linear_mod$coefficients[2])
+
+# Replace NA's with imputed values 
+heatingoil$heatingoil_per_gal <- ifelse(is.na(heatingoil$heatingoil_per_gal),
+       heatingoil$imputed_per_gal, heatingoil$heatingoil_per_gal)
+
+# Reduce dataframe to only contain month and heating oil price (incl imputed vals)
+heatingoil <- dplyr::select(heatingoil, c(month, heatingoil_per_gal))
+
+```
+
+
+```{r IMPORT ELECTRICITY DATA, include=FALSE}
+
+# Define file name/location and import
+file <- file.path("data", "sales_revenue.xlsx")
+electricity <- as.data.frame(
+  read_excel(file,
+             sheet = "Monthly-States",
+             range = cell_cols("A:H"),
+             col_names = c("year", "month", "state", "data_status","revenue",
+                           "sales", "customers", "electricity_per_kwh"),
+             col_types = c("numeric", "numeric", "text", "text", "numeric",
+                           "numeric", "numeric", "numeric")
+             )
+  )
+electricity <- electricity[-c(1:3), ]  # remove 1st three rows
+electricity <- electricity %>%
+  filter(state == "ME") %>%            # keep only Maine data
+  dplyr::select(-c(data_status, customers))   # remove unnecessary columns
+
+# Convert cents per kwh to dollars per kwh
+electricity$electricity_per_kwh <- electricity$electricity_per_kwh/100
+
+# Remove all columns except year, month, and price
+electricity <- electricity %>% dplyr::select(c(year, month, electricity_per_kwh))
+
+# Combine year and month and dummy "01" day into date
+electricity$combined_date = as.Date(paste0(electricity$year,"-",
+                                           electricity$month,"-01"), tz="UTC")
+
+# To match format of heating oil data, rename columns and drop unnecessary ones
+electricity <- electricity[ , c("combined_date", "electricity_per_kwh")]
+colnames(electricity) <- c("month", "electricity_per_kwh")
+
+# Sort from least recent to most recent
+electricity <- electricity %>% arrange(month)
+
+```
+
+
+```{r HEATING OIL PRICE FORECAST, include=FALSE}
+# Start date for forecast
+begin <- as.Date("2005-01-01")
+
+# Define objects for first month and year in the data
+startyear <- year(begin)
+startmon <- month(begin)
+
+# Filter for begin
+filtered <- heatingoil %>%
+  filter(month >= begin)
+
+# Define time series object w/ heating oil price data
+ho_ts <- ts(filtered$heatingoil_per_gal, frequency = 12,
+            start=c(startyear, startmon))
+
+# Make 30-month forecast for each model
+heatingoil30 <- forecast(arima(ho_ts, c(2,0,0)), 30)
+
+# Create sequence of dates for the 30 predicted months
+start_pred_o <- filtered$month[length(filtered$month)] %m+% months(1)
+end_pred_o <- filtered$month[length(filtered$month)] %m+% months(30)
+
+# Create dataframe for storing predicted values
+pred <- data.frame(
+  month = seq(start_pred_o, end_pred_o, "months"),
+  fore = heatingoil30$mean
+)
+
+# Get full range of months, historic and predicted
+all_months <- data.frame(
+  month = c(filtered$month, pred$month))
+
+# Combine historic and predicted data
+heatingoil_forecast <- left_join(all_months, filtered, by="month")
+heatingoil_forecast <- left_join(heatingoil_forecast, pred, by="month")
+
+# Make column for combined historic and predicted data
+heatingoil_forecast$dollars_per_gal <- rowSums(heatingoil_forecast[ 
+  ,c("heatingoil_per_gal", "fore")]
+  , na.rm=TRUE)
+
+# Change column names
+colnames(heatingoil_forecast) <- c("month",
+                                   "heatoil_historic_dollars_per_gal",
+                                   "heatoil_predicted_dollars_per_gal",
+                                   "heatoil_dollars_per_gal")
+
+```
+
+
+```{r ELECTRICITY PRICE FORECAST, include=FALSE}
+
+# Filter for begin
+filtered <- electricity %>%
+  filter(month >= begin)
+
+# Define time series object w/ heating oil price data
+el_ts <- ts(filtered$electricity_per_kwh, frequency = 12,
+            start=c(startyear, startmon))
+
+# Make 30-month forecast
+electricity30 <- rwf(el_ts, drift=TRUE, 30)
+
+# Create sequence of dates for the 30 predicted months
+start_pred_e <- filtered$month[length(filtered$month)] %m+% months(1)
+end_pred_e <- filtered$month[length(filtered$month)] %m+% months(30)
+
+# Create dataframe for storing predicted values
+pred <- data.frame(
+  month = seq(start_pred_e, end_pred_e, "months"),
+  fore = electricity30$mean
+)
+
+# Get full range of months, historic and predicted
+all_months <- data.frame(
+  month = c(filtered$month, pred$month))
+
+# Combine historic and predicted data
+electricity_forecast <- left_join(all_months, filtered, by="month")
+electricity_forecast <- left_join(electricity_forecast, pred, by="month")
+
+# Make column for combined historic and predicted data
+electricity_forecast$dollars_per_kwh <- rowSums(electricity_forecast[ 
+  ,c("electricity_per_kwh", "fore")]
+  , na.rm=TRUE)
+
+# Change column names
+colnames(electricity_forecast) <- c("month",
+                                   "elect_historic_dollars_per_kwh",
+                                   "elect_predicted_dollars_per_kwh",
+                                   "elect_dollars_per_kwh")
+
+```
+
+
+```{r MERGE INTO SINGLE DATAFRAME, include=FALSE}
+df <- merge(heatingoil_forecast, electricity_forecast, by="month")
+
+```
+
+
+```{r CALCULATE PER BTU, include=FALSE}
+
+# Define Efficiencies =  c(BTU's per unit, System Efficiency, Distribution Efficiency)
+electric_heat_pump <- c(3412, 2.93, 1.00)
+oil_boiler <- c(139000, 0.87, 0.80)
+electric_baseboard <- c(3412, 1.00, 1.00)
+
+## Calculate $ per million BTU historic, predicted, and combined for each heating type
+# Oil Boiler
+df$oilboiler_historic_dollars_per_milBTU <- 
+  1000000 * df$heatoil_historic_dollars_per_gal /
+  (oil_boiler[1]*oil_boiler[2]*oil_boiler[3])
+df$oilboiler_predicted_dollars_per_milBTU <- 
+  1000000 * df$heatoil_predicted_dollars_per_gal /
+  (oil_boiler[1]*oil_boiler[2]*oil_boiler[3])
+df$oilboiler_dollars_per_milBTU <- 
+  1000000 * df$heatoil_dollars_per_gal /
+  (oil_boiler[1]*oil_boiler[2]*oil_boiler[3])
+# Electric Baseboard
+df$electbaseb_historic_dollars_per_milBTU <- 
+  1000000 * df$elect_historic_dollars_per_kwh /
+  (electric_baseboard[1]*electric_baseboard[2]*electric_baseboard[3])
+df$electbaseb_predicted_dollars_per_milBTU <- 
+  1000000 * df$elect_predicted_dollars_per_kwh /
+  (electric_baseboard[1]*electric_baseboard[2]*electric_baseboard[3])
+df$electbaseb_dollars_per_milBTU <- 
+  1000000 * df$elect_dollars_per_kwh /
+  (electric_baseboard[1]*electric_baseboard[2]*electric_baseboard[3])
+# Electric Heat Pump
+df$electheatp_historic_dollars_per_milBTU <- 
+  1000000 * df$elect_historic_dollars_per_kwh /
+  (electric_heat_pump[1]*electric_heat_pump[2]*electric_heat_pump[3])
+df$electheatp_predicted_dollars_per_milBTU <- 
+  1000000 * df$elect_predicted_dollars_per_kwh /
+  (electric_heat_pump[1]*electric_heat_pump[2]*electric_heat_pump[3])
+df$electheatp_dollars_per_milBTU <- 
+  1000000 * df$elect_dollars_per_kwh /
+  (electric_heat_pump[1]*electric_heat_pump[2]*electric_heat_pump[3])
+```
+
+
+```{r CALCULATE PER TYPICAL HOUSE, include=FALSE}
+# Assume 80 million BTU per year
+# Oil Boiler
+df$oilboiler_historic_dollars_per_80milBTU<- 
+  df$oilboiler_historic_dollars_per_milBTU * 80
+df$oilboiler_predicted_dollars_per_80milBTU <- 
+  df$oilboiler_predicted_dollars_per_milBTU * 80
+df$oilboiler_dollars_per_80milBTU <- 
+  df$oilboiler_dollars_per_milBTU * 80
+# Electric Baseboard
+df$electbaseb_historic_dollars_per_80milBTU <- 
+  df$electbaseb_historic_dollars_per_milBTU * 80
+df$electbaseb_predicted_dollars_per_80milBTU <- 
+  df$electbaseb_predicted_dollars_per_milBTU * 80
+df$electbaseb_dollars_per_80milBTU <- 
+  df$electbaseb_dollars_per_milBTU * 80
+# Electric Heat Pump
+df$electheatp_historic_dollars_per_80milBTU <- 
+  df$electheatp_historic_dollars_per_milBTU * 80
+df$electheatp_predicted_dollars_per_80milBTU <- 
+  df$electheatp_predicted_dollars_per_milBTU * 80
+df$electheatp_dollars_per_80milBTU <- 
+  df$electheatp_dollars_per_milBTU * 80
+
+```
+
+---
+
+```{r PLOT HEATING OIL FORECAST, echo=FALSE}
+# Select columns for use in plot
+plot_df <- select(df, c(
+  month,
+  heatoil_historic_dollars_per_gal, 
+  heatoil_predicted_dollars_per_gal
+  ))
+
+# Rename columns
+colnames(plot_df) <- c("month", "historic", "predicted")
+
+# Pivot long to make format better for ggplot
+plot_df <- plot_df %>% 
+  pivot_longer(!month, names_to="time", values_to="dollars_per_gal")
+
+# Define some variables to be used in plotting:
+Labels = c("Historic Price", "Predicted Price")
+upperlimit_o <- ceiling(max(df$heatoil_dollars_per_gal))
+
+# Plot
+ggplot(data=plot_df,
+       aes(x=month, y=dollars_per_gal, size=time, col=time, linetype=time)) +
+  geom_line() +
+  scale_size_manual(values = c(1, 1), labels = Labels) +
+  scale_linetype_manual(values = c(1,2), labels = Labels) +
+  scale_color_manual(values=c("black",  "blue"), labels = Labels) +
+  scale_x_date(limits=c((start_pred_o %m-% months(121)), end_pred_o),
+               date_breaks="6 months", date_labels="%b%Y", expand = c(0, 0)) +
+  scale_y_continuous(labels=scales::dollar_format(accuracy=0.01),
+                     limits=c(0,upperlimit_o)) +
+  labs(title="30-Month Heating Oil Price Forecast for Maine ($/gal)*") +
+       #y=""
+  guides(col=guide_legend(""),
+         size=guide_legend(""),
+         linetype=guide_legend("")) +
+  theme(legend.key.size =  unit(0.5, "in"),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color="gray85", linetype = "dotted"),
+        plot.title = element_text(size=18, hjust=0.5, face="bold"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size=10, angle=45, hjust=1),
+        axis.text.y = element_text(size=12, face="bold"),
+        axis.title.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "top",
+        legend.text = element_text(size=12),
+        legend.key = element_rect(fill = NA, color = NA))
+
+
+
+```
+
+```{r HEATING OIL COST TABLE, echo=FALSE}
+
+thisOct <- as.Date(paste0(year(now()),"-10-01"))
+nextOct <- thisOct %m+% years(1)
+
+colsnames <- c(format(thisOct, "%b %Y"), format(nextOct, "%b %Y"))
+thisOctprice <- paste("$", unlist(sprintf("%.2f",
+  df[df$month == thisOct, c("heatoil_predicted_dollars_per_gal")])))
+nextOctprice <- paste("$", unlist(sprintf("%.2f",
+  df[df$month == nextOct, c("heatoil_predicted_dollars_per_gal")])))
+prices <- c(thisOctprice, nextOctprice)
+
+df_table <- data.frame(colsnames, prices)
+colnames(df_table) <- c(" ", "Est. Price per Gallon*")
+
+
+df_table %>%
+  kbl(align="c") %>%
+  kable_styling("striped", full_width=FALSE, font_size=16, position="center")  %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, bold=TRUE, color="blue") 
+```
+
+---
+
+<br>
+```{r PLOT ELECTRICITY FORECAST, echo=FALSE}
+# Select columns for use in plot
+plot_df <- select(df, c(
+  month,
+  elect_historic_dollars_per_kwh, 
+  elect_predicted_dollars_per_kwh
+  ))
+
+# Rename columns
+colnames(plot_df) <- c("month", "historic", "predicted")
+
+# Pivot long to make format better for ggplot
+plot_df <- plot_df %>% 
+  pivot_longer(!month, names_to="time", values_to="dollars_per_kwh")
+
+# Define some variables to be used in plotting:
+Labels = c("Historic Price", "Predicted Price")
+upperlimit_e <- ceiling(max(df$elect_dollars_per_kwh)*2) / 2
+
+
+# Plot
+ggplot(data=plot_df,
+       aes(x=month, y=dollars_per_kwh, size=time, col=time, linetype=time)) +
+  geom_line() +
+  scale_size_manual(values = c(1, 1), labels = Labels) +
+  scale_linetype_manual(values = c(1,2), labels = Labels) +
+  scale_color_manual(values=c("black",  "red"), labels = Labels) +
+  scale_x_date(limits=c((start_pred_e %m-% months(121)), end_pred_e),
+               date_breaks="6 months", date_labels="%b%Y", expand = c(0, 0)) +
+  scale_y_continuous(labels=scales::dollar_format(accuracy=0.01),
+                     limits=c(0,upperlimit_e)) +
+  labs(title="30-Month Electricity Price Forecast for Maine ($/kwh)*") +
+       #y=""
+  guides(col=guide_legend(""),
+         size=guide_legend(""),
+         linetype=guide_legend("")) +
+  theme(legend.key.size =  unit(0.5, "in"),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color="gray85", linetype = "dotted"),
+        plot.title = element_text(size=18, hjust=0.5, face="bold"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size=10, angle=45, hjust=1),
+        axis.text.y = element_text(size=12, face="bold"),
+        axis.title.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "top",
+        legend.text = element_text(size=12),
+        legend.key = element_rect(fill = NA, color = NA))
+
+
+
+```
+
+```{r ELECTRICITY COST TABLE, echo=FALSE}
+
+thisOctprice <- paste("$", unlist(sprintf("%.3f",
+  df[df$month == thisOct, c("elect_predicted_dollars_per_kwh")])))
+nextOctprice <- paste("$", unlist(sprintf("%.3f",
+  df[df$month == nextOct, c("elect_predicted_dollars_per_kwh")])))
+prices <- c(thisOctprice, nextOctprice)
+
+df_table <- data.frame(colsnames, prices)
+colnames(df_table) <- c(" ", "Est. Price per kWh*")
+
+
+df_table %>%
+  kbl(align="c") %>%
+  kable_styling("striped", full_width=FALSE, font_size=16, position="center")  %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, bold=TRUE, color="red") 
+```
+
+---
+
+<br>
+```{r PLOT DOLLARS PER MILLION BTU COMPARISON, echo=FALSE}
+# Select columns for use in plot
+plot_df <- select(df, c(
+  month,
+  oilboiler_historic_dollars_per_milBTU, 
+  oilboiler_predicted_dollars_per_milBTU,
+  electbaseb_historic_dollars_per_milBTU, 
+  electbaseb_predicted_dollars_per_milBTU,
+  electheatp_historic_dollars_per_milBTU, 
+  electheatp_predicted_dollars_per_milBTU
+  ))
+
+# Rename columns
+colnames(plot_df) <- c("month", "ob_historic", "ob_predicted", 
+                       "ebb_historic", "ebb_predicted",
+                       "ehp_historic", "ehp_predicted")
+
+# Pivot long to make format better for ggplot
+plot_df <- plot_df %>% 
+  pivot_longer(!month, names_to="heat", values_to="dollars_per_milBTU")
+
+# Provide order
+plot_df$heat <- factor(
+  plot_df$heat, 
+  levels=c("ob_historic", "ob_predicted", 
+                       "ebb_historic", "ebb_predicted",
+                       "ehp_historic", "ehp_predicted"))
+
+# Define some variables to be used in plotting:
+Labels = c("Oil Boiler (Historic)", "Oil Boiler (Predicted)",
+           "Electric Baseboard (Historic)", "Electric Baseboard (Predicted)",
+           "Electric Heat Pump (Historic)", "Electric Heat Pump (Predicted)")
+Labels = c(" ", "Oil Boiler",
+           " ", "Electric Baseboard",
+           " ", "Electric Heat Pump")
+
+
+upperlimit_btu <- ceiling(max(pmax(
+  df$oilboiler_historic_dollars_per_milBTU,
+  df$oilboiler_predicted_dollars_per_milBTU,
+  df$electbaseb_historic_dollars_per_milBTU,
+  df$electbaseb_predicted_dollars_per_milBTU,
+  df$electheatp_historic_dollars_per_milBTU,
+  df$electheatp_predicted_dollars_per_milBTU, na.rm=TRUE))/10)*10
+
+# Plot
+ggplot(data=plot_df,
+       aes(x=month, y=dollars_per_milBTU, size=heat, 
+           col=heat, 
+           linetype=heat)) +
+  geom_line() +
+  scale_size_manual(values = c(1, 1, 1, 1, 1, 1), labels = Labels) +
+  scale_linetype_manual(values = c(1,2,1,2,1,2), labels = Labels) +
+  scale_color_manual(values=c("blue",  "blue",
+                              "orange", "orange",
+                              "red", "red"), labels = Labels) +
+  scale_x_date(limits=c((start_pred_o %m-% months(121)), end_pred_o),
+               date_breaks="6 months", 
+               date_labels="%b%Y", 
+               expand = expansion(mult = c(0, 0.25))) +
+  scale_y_continuous(labels=scales::dollar_format(accuracy=0.01),
+                    limits=c(0,upperlimit_btu)) +
+  labs(title="Heating Price Forecast Comparison ($ per million BTU)*") +
+  geom_text(aes(label="Oil Boiler"), 
+            x=end_pred_o, y=last(df$oilboiler_predicted_dollars_per_milBTU), 
+            size=4, col="blue", hjust = -0.01, vjust=0.5) +
+  geom_text(aes(label="Electric Baseboard"), 
+            x=end_pred_e, y=last(df$electbaseb_predicted_dollars_per_milBTU), 
+            size=4, col="orange", hjust = -0.01, vjust=0.5) +
+  geom_text(aes(label="Electric Heat Pump"), 
+            x=end_pred_e, y=last(df$electheatp_predicted_dollars_per_milBTU), 
+            size=4, col="red", hjust = -0.01, vjust=0.5) +
+  theme(legend.key.size =  unit(0.5, "in"),
+        panel.background = element_blank(),
+        panel.grid.major = element_line(color="gray85", linetype = "dotted"),
+        plot.title = element_text(size=18, hjust=0.5, face="bold"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size=10, angle=45, hjust=1 #, color=datecolor
+                                   ),
+        axis.text.y = element_text(size=12, face="bold"),
+        axis.title.y = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none"
+        #legend.position = "top",
+        #legend.text = element_text(size=10),
+        #legend.key = element_rect(fill = NA, color = NA)
+        )
+
+
+
+```
+
+
+```{r COMPARE COST PER MILLION BTU TABLE, echo=FALSE}
+
+col1 <- c("Electric Baseboard", "Oil Boiler", "Electric Heat Pump")
+col2 <- unlist(df[df$month == thisOct, c("electbaseb_dollars_per_milBTU", "oilboiler_dollars_per_milBTU", "electheatp_dollars_per_milBTU")])
+col3 <- unlist(df[df$month == nextOct, c("electbaseb_dollars_per_milBTU", "oilboiler_dollars_per_milBTU", "electheatp_dollars_per_milBTU")])
+
+df_table <- as.data.frame(cbind(col2, col3))
+
+mult_oilfurn_thisOct <- round(df_table[2,1] / df_table[3,1],1)
+mult_oilfurn_nextOct <- round(df_table[2,2] / df_table[3,2],1)
+mult_electbaseb_thisOct <- round(df_table[1,1] / df_table[3,1],1)
+mult_electbaseb_nextOct <- round(df_table[1,2] / df_table[3,2],1)
+
+df_table$col2 <- paste("$",round(df_table$col2, 2))
+df_table$col3 <- paste("$",round(df_table$col3, 2))
+rownames(df_table) <- col1
+colnames(df_table) <- c(
+  format(as.Date(thisOct), "%b %Y"),
+  format(as.Date(nextOct), "%b %Y")
+                        )
+
+df_table %>% 
+  kbl() %>%
+  kable_styling("striped", full_width=FALSE, font_size=18) %>%
+  row_spec(1, bold=TRUE, color="orange") %>%
+  row_spec(2, bold=TRUE, color="blue") %>%
+  row_spec(3, bold=TRUE, color="red")
+
+
+```
+<br>
+<br>
+In<font size="4"> **`r toString(format(as.Date(thisOct), "%b %Y"))`**, </font>heating with an <font size="4"><span style="color: blue;">**oil boiler**</span></font> is estimated to cost<font size="4"> **`r mult_oilfurn_thisOct` x** </font>more than heating with <font size="4"><span style="color: red;">**electric heat pumps**</span></font>,<br>
+and heating with <font size="4"><span style="color: orange;">**electric baseboard heating**</span></font> is estimated to cost<font size="4"> **`r mult_electbaseb_thisOct` x** </font>more than heating with <font size="4"><span style="color: red;">**electric heat pumps**</span></font>.
+
+<br>
+
+In<font size="4"> **`r toString(format(as.Date(nextOct), "%b %Y"))`**, </font>heating with an <font size="4"><span style="color: blue;">**oil boiler**</span></font> is estimated to cost<font size="4"> **`r mult_oilfurn_nextOct` x** </font>more than heating with <font size="4"><span style="color: red;">**electric heat pumps**</span></font>,<br>
+and heating with <font size="4"><span style="color: orange;">**electric baseboard heating**</span></font> is estimated to cost<font size="4"> **`r mult_electbaseb_nextOct` x** </font>more than heating with <font size="4"><span style="color: red;">**electric heat pumps**</span></font>.
+<br>
+<br>
+
+---
+
+***\*Notes:***
+
+* *Historic heating oil prices obtained from the State of Maine Governor's Energy Office data.*
+* *Historic heating oil prices for non-heating-season months that were missing from the data were obtained by imputation using a linear regression model based on U.S. On-Highway Diesel Fuel Prices obtained from the U.S. Energy Information Administration.*
+* *Heating oil prices predicted using an ARIMA(2,0,0) model, which has a 1-month forecast Mean Absolute Percentage Error (MAPE) of 3.44%, a 6-month forecast MAPE of 12.83%, and an 18-month forecast MAPE of 22.69%.*
+* *Historic electricity prices obtained from the U.S. Energy Information Administration's average monthly residential price, which is calculated by total revenue divided by the number of customers.*
+* *Electricity prices predicted using a random walk with drift model, which has a 1-month forecast Mean Absolute Percentage Error (MAPE) of 1.51%, a 6-month forecast MAPE of 3.30%, and an 18-month forecast MAPE of 4.95%.*
+* *Calculating dollars per million BTU for each heating type was performed using BTU's per unit, system efficiencies, and distribution efficiencies obtained from Efficiency Maine.*
+<br>
+<br>
+<br>
+
+---
+
